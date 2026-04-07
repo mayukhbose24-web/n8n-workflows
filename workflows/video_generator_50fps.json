@@ -1,0 +1,264 @@
+{
+  "name": "AI Image-to-Video Generator (50 FPS)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "video-generator-50fps",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "Webhook_In",
+      "name": "Webhook In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1160,
+        120
+      ],
+      "webhookId": "video-generator-50fps"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $json.body ?? $json;\nconst textPrompt = String(body.text_prompt ?? body.prompt ?? '').trim();\nconst negativePrompt = String(body.negative_prompt ?? '').trim();\nconst audioUrl = String(body.audio_url ?? '').trim();\nconst durationSeconds = Number(body.duration_seconds ?? body.duration ?? 5);\nconst width = Number(body.width ?? 1024);\nconst height = Number(body.height ?? 1024);\nconst fps = 50;\n\nif (!textPrompt) {\n  throw new Error('text_prompt is required');\n}\nif (!Number.isFinite(durationSeconds) || durationSeconds < 5 || durationSeconds > 1800) {\n  throw new Error('duration_seconds must be between 5 and 1800 seconds (5 sec to 30 min)');\n}\nif (!audioUrl) {\n  throw new Error('audio_url is required');\n}\n\nconst totalFrames = Math.round(durationSeconds * fps);\nconst jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;\nconst frames = [];\n\nfor (let i = 0; i < totalFrames; i++) {\n  const t = Number((i / fps).toFixed(3));\n  const prompt = `${textPrompt}. cinematic consistency, frame ${i + 1} of ${totalFrames}, timestamp ${t}s`;\n  frames.push({\n    frame_index: i,\n    timestamp_seconds: t,\n    schema: {\n      type: 'video_frame_prompt_v1',\n      job_id: jobId,\n      frame_index: i,\n      timestamp_seconds: t,\n      prompt,\n      negative_prompt: negativePrompt,\n      image: { width, height },\n      video: { fps, duration_seconds: durationSeconds }\n    }\n  });\n}\n\nreturn [{\n  json: {\n    jobId,\n    fps,\n    durationSeconds,\n    totalFrames,\n    width,\n    height,\n    audioUrl,\n    webhookUrl: 'https://ppbprahann.app.n8n.cloud/webhook/e665ed44-516c-45a2-afe6-c291e2d7f02a',\n    frames\n  }\n}];"
+      },
+      "id": "Build_Frame_Schemas",
+      "name": "Build Frame Schemas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -920,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const root = items[0].json;\nreturn root.frames.map((frame) => ({\n  json: {\n    jobId: root.jobId,\n    fps: root.fps,\n    durationSeconds: root.durationSeconds,\n    totalFrames: root.totalFrames,\n    audioUrl: root.audioUrl,\n    frame\n  }\n}));"
+      },
+      "id": "Explode_Frames",
+      "name": "Explode Frames",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{'https://ppbprahann.app.n8n.cloud/webhook/e665ed44-516c-45a2-afe6-c291e2d7f02a'}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json.frame.schema}}",
+        "options": {
+          "timeout": 600000
+        }
+      },
+      "id": "Generate_Frame_Image",
+      "name": "Generate Frame Image",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -430,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const incoming = $json;\nconst imageUrl = incoming.image_url ?? incoming.url ?? incoming.output_url ?? incoming.data?.image_url ?? incoming.data?.url;\nif (!imageUrl) {\n  throw new Error('Image webhook response missing image_url/url/output_url');\n}\n\nconst src = $item(0).$node['Explode Frames'].json;\nreturn [{\n  json: {\n    jobId: src.jobId,\n    fps: src.fps,\n    durationSeconds: src.durationSeconds,\n    totalFrames: src.totalFrames,\n    audioUrl: src.audioUrl,\n    frame_index: src.frame.frame_index,\n    image_url: imageUrl\n  }\n}];"
+      },
+      "id": "Normalize_Image_Response",
+      "name": "Normalize Image Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -190,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const all = items.map((i) => i.json).sort((a, b) => a.frame_index - b.frame_index);\nif (!all.length) throw new Error('No generated frames found');\nconst first = all[0];\nconst payload = {\n  jobId: first.jobId,\n  fps: first.fps,\n  durationSeconds: first.durationSeconds,\n  totalFrames: first.totalFrames,\n  audioUrl: first.audioUrl,\n  frames: all.map((x) => ({ frame_index: x.frame_index, image_url: x.image_url }))\n};\nconst manifestBase64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64');\nreturn [{ json: { ...payload, manifestBase64 } }];"
+      },
+      "id": "Build_Manifest",
+      "name": "Build Manifest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=bash -lc 'set -euo pipefail\nJOB_ID={{$json.jobId}}\nWORK=\"/tmp/n8n-video-$JOB_ID\"\nmkdir -p \"$WORK/frames\"\necho \"{{$json.manifestBase64}}\" | base64 -d > \"$WORK/manifest.json\"\npython3 - <<\"PY\"\nimport json, os, urllib.request\nwork = os.environ[\"WORK\"]\nwith open(f\"{work}/manifest.json\", \"r\", encoding=\"utf-8\") as f:\n    data = json.load(f)\nfor frame in data[\"frames\"]:\n    idx = frame[\"frame_index\"]\n    url = frame[\"image_url\"]\n    out = f\"{work}/frames/frame_{idx:09d}.png\"\n    urllib.request.urlretrieve(url, out)\nurllib.request.urlretrieve(data[\"audioUrl\"], f\"{work}/audio_input\")\nwith open(f\"{work}/meta.env\", \"w\", encoding=\"utf-8\") as f:\n    f.write(f\"FPS={data['fps']}\\n\")\nPY\nprintf \"work_dir=%s\\n\" \"$WORK\"'"
+      },
+      "id": "Download_Assets",
+      "name": "Download Assets",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        320,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "command": "=bash -lc 'set -euo pipefail\nWORK=$(echo \"{{$json.stdout}}\" | awk -F= \"/work_dir=/{print $2}\")\nif [ -z \"$WORK\" ]; then echo \"Missing work directory\"; exit 1; fi\nsource \"$WORK/meta.env\"\nffmpeg -y -framerate \"$FPS\" -i \"$WORK/frames/frame_%09d.png\" -i \"$WORK/audio_input\" -c:v libx264 -pix_fmt yuv420p -r \"$FPS\" -c:a aac -shortest \"$WORK/output.mp4\"\necho \"$WORK/output.mp4\"'"
+      },
+      "id": "Render_Video",
+      "name": "Render Video",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        560,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "filePath": "={{$json.stdout.trim()}}",
+        "options": {}
+      },
+      "id": "Read_Binary_Video",
+      "name": "Read Binary Video",
+      "type": "n8n-nodes-base.readBinaryFile",
+      "typeVersion": 1,
+      "position": [
+        810,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "responseBody": "=output.mp4",
+        "options": {
+          "binaryPropertyName": "data"
+        }
+      },
+      "id": "Respond_Webhook",
+      "name": "Respond Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1060,
+        120
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook In": {
+      "main": [
+        [
+          {
+            "node": "Build Frame Schemas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Frame Schemas": {
+      "main": [
+        [
+          {
+            "node": "Explode Frames",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Explode Frames": {
+      "main": [
+        [
+          {
+            "node": "Generate Frame Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Frame Image": {
+      "main": [
+        [
+          {
+            "node": "Normalize Image Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Image Response": {
+      "main": [
+        [
+          {
+            "node": "Build Manifest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Manifest": {
+      "main": [
+        [
+          {
+            "node": "Download Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Assets": {
+      "main": [
+        [
+          {
+            "node": "Render Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Video": {
+      "main": [
+        [
+          {
+            "node": "Read Binary Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Binary Video": {
+      "main": [
+        [
+          {
+            "node": "Respond Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "a4f71358-e4e4-4c74-a397-89d65ebf58b2",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "id": "video-generator-50fps-template",
+  "tags": []
+}
